@@ -156,9 +156,31 @@ function Bridge(editor) {
         this.setText(data);
     };
 
+    this._clearSearchState = function (clearSelection) {
+        var state = window.bdSearchState || null;
+        if (!state) return;
+        var markerSession = state.session || editor.session;
+        if (state.markers) {
+            for (var i = 0; i < state.markers.length; i++) {
+                markerSession.removeMarker(state.markers[i]);
+            }
+        }
+        if (state.activeMarker) {
+            markerSession.removeMarker(state.activeMarker);
+        }
+        window.bdSearchState = null;
+        if (editor.exitMultiSelectMode) {
+            editor.exitMultiSelectMode();
+        }
+        if (clearSelection !== false) {
+            editor.clearSelection();
+        }
+    };
+
     this.setText = function (data) {
 
         this.loading = true;
+        this._clearSearchState(false);
 
         var text = data['text'];
         var file = data['file'];
@@ -231,33 +253,172 @@ function Bridge(editor) {
 
 
     this.doFind = function (data) {
-        if (data.replaceText) {
-            editor.replaceAll(data.replaceText, {
-                needle: data.findText,
-                caseSensitive: data.caseSensitive,
-                regExp: false,
-                wholeWord: false,
-            });
-        } else {
-            editor.findAll(data.findText, {
-                caseSensitive: data.caseSensitive,
-                regExp: false,
-                wholeWord: false,
-            });
+        data = data || {};
+        var action = data.replaceText == null ? "find" : "replace";
+        return this._searchAction({
+            action: action,
+            findText: data.findText,
+            replaceText: data.replaceText,
+            caseSensitive: data.caseSensitive,
+            wholeWordOnly: data.wholeWordOnly,
+            regex: data.regex,
+            startIndex: data.startIndex,
+            focusEditor: data.focusEditor
+        });
+    };
+
+    this.moveSearchResult = function (data) {
+        data = data || {};
+        return this._searchAction({
+            action: "move",
+            forward: data.forward,
+            focusEditor: data.focusEditor
+        });
+    };
+
+    this.clearSearchResult = function () {
+        return this._searchAction({action: "clear"});
+    };
+
+    this._searchAction = function (data) {
+        var session = editor.session;
+        var bridge = this;
+        var state = window.bdSearchState || null;
+        var markerLimit = typeof data.maxMarkers === "number" && isFinite(data.maxMarkers)
+            ? Math.max(0, data.maxMarkers | 0)
+            : 1000;
+
+        function emptySummary() {
+            return JSON.stringify({current: 0, total: 0});
         }
-        var range = editor.getSelectionRange();
-        var pos = {
-            row: Math.floor(range.start.row + (range.end.row - range.start.row) / 2),
-            column: Math.floor(range.start.column + (range.end.column - range.start.column) / 2)
-        };
-        pos = editor.renderer.$cursorLayer.getPixelPosition(pos);
-        var h = editor.renderer.$size.scrollerHeight - editor.renderer.lineHeight;
-        var offsetY = pos.top - h * 0.5;
 
-        var w = editor.renderer.$size.scrollerWidth - editor.renderer.characterWidth;
-        var offsetX = pos.left - w * 0.5;
+        function summary() {
+            var s = window.bdSearchState;
+            var total = s && s.ranges ? s.ranges.length : 0;
+            var current = total > 0 ? s.index + 1 : 0;
+            return JSON.stringify({current: current, total: total});
+        }
 
-        editor.renderer.scrollTo(offsetX, offsetY);
+        function ensureCss() {
+            var dom = require("ace/lib/dom");
+            dom.importCssString(
+                ".ace_marker-layer .ace_search_result {" +
+                "position:absolute;z-index:4;box-sizing:border-box;" +
+                "background:rgba(255,213,79,.38);border-radius:2px;" +
+                "}" +
+                ".ace_marker-layer .ace_search_active {" +
+                "position:absolute;z-index:7;box-sizing:border-box;" +
+                "background:rgba(255,171,64,.7);border-radius:2px;" +
+                "}" +
+                ".ace_dark .ace_marker-layer .ace_search_result {" +
+                "background:rgba(255,213,79,.34);" +
+                "}" +
+                ".ace_dark .ace_marker-layer .ace_search_active {" +
+                "background:rgba(255,193,7,.82);" +
+                "}",
+                "bd_search_result_css",
+                false
+            );
+        }
+
+        function clearSearch() {
+            bridge._clearSearchState();
+            state = null;
+        }
+
+        function searchOptions() {
+            return {
+                needle: data.findText || "",
+                caseSensitive: !!data.caseSensitive,
+                regExp: !!data.regex,
+                wholeWord: !!data.wholeWordOnly,
+                wrap: true
+            };
+        }
+
+        function findStartIndex(ranges) {
+            if (typeof data.startIndex === "number" && isFinite(data.startIndex)) {
+                var index = data.startIndex | 0;
+                if (index < 0) return 0;
+                if (index >= ranges.length) return ranges.length - 1;
+                return index;
+            }
+            var cursor = editor.getCursorPosition();
+            for (var i = 0; i < ranges.length; i++) {
+                var start = ranges[i].start;
+                if (start.row > cursor.row || (start.row === cursor.row && start.column >= cursor.column)) {
+                    return i;
+                }
+            }
+            return 0;
+        }
+
+        function activate(index) {
+            state = window.bdSearchState;
+            if (!state || !state.ranges || !state.ranges.length) return;
+            if (state.activeMarker) {
+                session.removeMarker(state.activeMarker);
+            }
+            state.index = index;
+            var range = state.ranges[index];
+            editor.selection.setSelectionRange(range, false);
+            state.activeMarker = session.addMarker(range, "ace_search_active", "text", false);
+            editor.renderer.scrollCursorIntoView(null, 0.5);
+            if (data.focusEditor !== false) {
+                editor.focus();
+            }
+        }
+
+        if (data.action === "clear") {
+            clearSearch();
+            return emptySummary();
+        }
+
+        if (data.action === "replace") {
+            clearSearch();
+            var replaceOptions = searchOptions();
+            if (!replaceOptions.needle) return emptySummary();
+            editor.replaceAll(data.replaceText || "", replaceOptions);
+            return emptySummary();
+        }
+
+        if (data.action === "find") {
+            clearSearch();
+            var options = searchOptions();
+            if (!options.needle) return emptySummary();
+            ensureCss();
+            var Search = require("ace/search").Search;
+            var search = new Search();
+            search.set(options);
+            var ranges = search.findAll(session);
+            state = {
+                session: session,
+                ranges: ranges,
+                index: 0,
+                markers: [],
+                activeMarker: null
+            };
+            window.bdSearchState = state;
+            for (var i = 0, markerCount = Math.min(ranges.length, markerLimit); i < markerCount; i++) {
+                state.markers.push(session.addMarker(ranges[i], "ace_search_result", "text", false));
+            }
+            if (ranges.length > 0) {
+                activate(findStartIndex(ranges));
+            } else {
+                editor.clearSelection();
+            }
+            return summary();
+        }
+
+        if (data.action === "move") {
+            state = window.bdSearchState;
+            if (!state || !state.ranges || !state.ranges.length) return summary();
+            var step = data.forward === false ? -1 : 1;
+            activate((state.index + step + state.ranges.length) % state.ranges.length);
+            return summary();
+        }
+
+        return summary();
     };
 
     this.setFontSize = function (data) {

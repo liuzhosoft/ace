@@ -17,7 +17,16 @@ exports.addTouchListeners = function(el, editor) {
     var lastT;
     var longTouchTimer;
     var animationTimer;
+    var touchScrollTimer;
+    var touchScrollEndTimer;
+    var touchScrollActive = false;
     var animationSteps = 0;
+    var animationElapsed = 0;
+    var animationLastT = 0;
+    var pendingScrollX = 0;
+    var pendingScrollY = 0;
+    var initialX;
+    var initialY;
     var pos;
     var clickCount = 0;
     var vX = 0;
@@ -25,6 +34,167 @@ exports.addTouchListeners = function(el, editor) {
     var pressed;
     var contextMenu;
     var didLongTap = false;
+    var maxFlingVelocity = 5;
+    var minFlingVelocity = 0.018;
+    var flingFriction = 0.0016;
+    var maxFlingDuration = 2200;
+    var requestFrame = window.requestAnimationFrame || function(callback) {
+        return setTimeout(function() {
+            callback(Date.now());
+        }, 16);
+    };
+    var cancelFrame = window.cancelAnimationFrame || clearTimeout;
+
+    if (el.style)
+        el.style.touchAction = "none";
+
+    function setTouchScrollExtrasSkipped(renderer, skip) {
+        if (!renderer)
+            return;
+        renderer.$skipTouchScrollExtras = skip;
+    }
+
+    function refreshTouchScrollExtras(renderer) {
+        var config = renderer.layerConfig;
+        if (renderer.$customScrollbar && renderer.$scrollDecorator)
+            renderer.$scrollDecorator.$updateDecorators(config);
+        if (renderer.$textLayer && renderer.$textLayer.$highlightIndentGuide)
+            renderer.$textLayer.$highlightIndentGuide();
+        if (renderer.$gutterLayer) {
+            if (renderer.$gutterLayer.updateLineHighlight)
+                renderer.$gutterLayer.updateLineHighlight();
+            if (renderer.$gutterLayer.$updateGutterWidth)
+                renderer.$gutterLayer.$updateGutterWidth(config);
+        }
+        if (renderer.$markerBack)
+            renderer.$markerBack.update(config);
+        if (renderer.$markerFront)
+            renderer.$markerFront.update(config);
+        if (renderer.$cursorLayer)
+            renderer.$cursorLayer.update(config);
+        if (renderer.$selectorLayer)
+            renderer.$selectorLayer.update(config);
+        if (renderer.$moveTextAreaToCursor)
+            renderer.$moveTextAreaToCursor();
+    }
+
+    function finishTouchScroll() {
+        touchScrollEndTimer = null;
+        touchScrollActive = false;
+        if (!editor.renderer)
+            return;
+        setTouchScrollExtrasSkipped(editor.renderer, false);
+        refreshTouchScrollExtras(editor.renderer);
+    }
+
+    function beginTouchScroll() {
+        if (touchScrollEndTimer) {
+            clearTimeout(touchScrollEndTimer);
+            touchScrollEndTimer = null;
+        }
+        var wasActive = touchScrollActive;
+        touchScrollActive = true;
+        setTouchScrollExtrasSkipped(editor.renderer, true);
+        if (!wasActive && editor.renderer && editor.renderer.$selectorLayer) {
+            editor.renderer.$selectorLayer.hideMidSelectHandle();
+            editor.renderer.$selectorLayer.hideLeftRightSelectHandle();
+        }
+    }
+
+    function endTouchScroll(delay) {
+        if (!touchScrollActive)
+            return;
+        if (touchScrollEndTimer)
+            clearTimeout(touchScrollEndTimer);
+        touchScrollEndTimer = setTimeout(finishTouchScroll, delay == null ? 80 : delay);
+    }
+
+    function cancelAnimation() {
+        if (!animationTimer)
+            return;
+        cancelFrame(animationTimer);
+        animationTimer = null;
+        animationSteps = 0;
+        animationElapsed = 0;
+        animationLastT = 0;
+        endTouchScroll();
+    }
+
+    function getScrollableDelta(x, y) {
+        if (x && !editor.renderer.isScrollableBy(x, 0))
+            x = 0;
+        if (y && !editor.renderer.isScrollableBy(0, y))
+            y = 0;
+        if (!x && !y)
+            return null;
+        return {x: x, y: y};
+    }
+
+    function scrollByTouch(x, y) {
+        var delta = getScrollableDelta(x, y);
+        if (!delta)
+            return false;
+        editor.renderer.scrollBy(delta.x, delta.y);
+        return true;
+    }
+
+    function applyPendingScroll() {
+        touchScrollTimer = null;
+        var x = pendingScrollX;
+        var y = pendingScrollY;
+        pendingScrollX = pendingScrollY = 0;
+        if (!x && !y)
+            return false;
+        return scrollByTouch(x, y);
+    }
+
+    function flushPendingScroll() {
+        if (touchScrollTimer) {
+            cancelFrame(touchScrollTimer);
+            touchScrollTimer = null;
+        }
+        return applyPendingScroll();
+    }
+
+    function cancelPendingScroll() {
+        if (touchScrollTimer) {
+            cancelFrame(touchScrollTimer);
+            touchScrollTimer = null;
+        }
+        pendingScrollX = pendingScrollY = 0;
+    }
+
+    function scheduleScrollByTouch(x, y) {
+        var delta = getScrollableDelta(x, y);
+        if (!delta)
+            return false;
+        beginTouchScroll();
+        pendingScrollX += delta.x;
+        pendingScrollY += delta.y;
+        if (!touchScrollTimer)
+            touchScrollTimer = requestFrame(applyPendingScroll);
+        return true;
+    }
+
+    function clampVelocity(value) {
+        return Math.max(-maxFlingVelocity, Math.min(maxFlingVelocity, value));
+    }
+
+    function getEventTime(e) {
+        return e.timeStamp || Date.now();
+    }
+
+    function updateVelocity(x, y, dt) {
+        if (dt <= 0 || dt > 80)
+            return;
+        var nextX = x / dt;
+        var nextY = y / dt;
+        var weight = Math.max(0.25, Math.min(0.75, dt / 40));
+        vX = vX && nextX && vX * nextX > 0 ? vX * (1 - weight) + nextX * weight : nextX;
+        vY = vY && nextY && vY * nextY > 0 ? vY * (1 - weight) + nextY * weight : nextY;
+        vX = clampVelocity(vX);
+        vY = clampVelocity(vY);
+    }
     
     function hasNativeMenu() {
         var nativeEditor = window["AndroidEditor"];
@@ -226,7 +396,10 @@ exports.addTouchListeners = function(el, editor) {
     }, editor);
     event.addListener(el, "touchstart", function (e) {
         var touches = e.touches;
+        cancelAnimation();
+        cancelPendingScroll();
         if (longTouchTimer || touches.length > 1) {
+            endTouchScroll(0);
             clearTimeout(longTouchTimer);
             longTouchTimer = null;
             touchStartT = -1;
@@ -237,7 +410,7 @@ exports.addTouchListeners = function(el, editor) {
         pressed = editor.$mouseHandler.isMousePressed = true;
         var h = editor.renderer.layerConfig.lineHeight;
         var w = editor.renderer.layerConfig.lineHeight;
-        var t = e.timeStamp;
+        var t = getEventTime(e);
         lastT = t;
         var touchObj = touches[0];
         var x = touchObj.clientX;
@@ -248,6 +421,8 @@ exports.addTouchListeners = function(el, editor) {
         
         startX = e.clientX = x;
         startY = e.clientY = y;
+        initialX = x;
+        initialY = y;
         vX = vY = 0;
         
         var ev = new MouseEvent(e, editor);
@@ -289,7 +464,7 @@ exports.addTouchListeners = function(el, editor) {
             );
             if (diff1 < 3.5 && diff2 < 3.5)
                 mode = diff1 > diff2 ? "cursor" : "anchor";
-                
+
             if (diff2 < 3.5)
                 mode = "anchor";
             else if (diff1 < 3.5)
@@ -305,8 +480,9 @@ exports.addTouchListeners = function(el, editor) {
 
     event.addListener(el, "touchend", function (e) {
         pressed = editor.$mouseHandler.isMousePressed = false;
-        if (animationTimer) clearInterval(animationTimer);
+        cancelAnimation();
         if (mode == "zoom") {
+            endTouchScroll(0);
             mode = "";
             animationSteps = 0;
         } else if (longTouchTimer) {
@@ -320,6 +496,7 @@ exports.addTouchListeners = function(el, editor) {
             }
             lastPos = pos;
         } else if (mode == "scroll") {
+            flushPendingScroll();
             animate();
             // console.log("liuzh: touched-hideContextMenu-2, el="+el.id);
             hideContextMenu();
@@ -330,6 +507,16 @@ exports.addTouchListeners = function(el, editor) {
         didLongTap = false;
         clearTimeout(longTouchTimer);
         longTouchTimer = null;
+    }, editor);
+    event.addListener(el, "touchcancel", function () {
+        pressed = editor.$mouseHandler.isMousePressed = false;
+        cancelAnimation();
+        cancelPendingScroll();
+        endTouchScroll(0);
+        didLongTap = false;
+        clearTimeout(longTouchTimer);
+        longTouchTimer = null;
+        mode = "";
     }, editor);
     event.addListener(el, "touchmove", function (e) {
         if (longTouchTimer) {
@@ -343,12 +530,21 @@ exports.addTouchListeners = function(el, editor) {
 
         var wheelX = startX - touchObj.clientX;
         var wheelY = startY - touchObj.clientY;
+        var totalX = touchObj.clientX - initialX;
+        var totalY = touchObj.clientY - initialY;
+        var absTotalX = Math.abs(totalX);
+        var absTotalY = Math.abs(totalY);
+        var scrollSwitchDistance = Math.max(6, editor.renderer.layerConfig.lineHeight * 0.35);
 
         if (mode == "wait") {
             if (wheelX * wheelX + wheelY * wheelY > 4)
                 mode = "cursor";
             else
                 return e.preventDefault();
+        }
+        if ((mode == "cursor" || mode == "anchor") && editor.selection.isEmpty()) {
+            if (absTotalY > scrollSwitchDistance && absTotalY > absTotalX * 1.1)
+                mode = "scroll";
         }
 
         startX = touchObj.clientX;
@@ -357,22 +553,25 @@ exports.addTouchListeners = function(el, editor) {
         e.clientX = touchObj.clientX;
         e.clientY = touchObj.clientY;
 
-        var t = e.timeStamp;
+        var t = getEventTime(e);
         var dt = t - lastT;
         lastT = t;
         if (mode == "scroll") {
-            var mouseEvent = new MouseEvent(e, editor);
-            mouseEvent.speed = 1;
-            mouseEvent.wheelX = wheelX;
-            mouseEvent.wheelY = wheelY;
-            if (10 * Math.abs(wheelX) < Math.abs(wheelY)) wheelX = 0;
-            if (10 * Math.abs(wheelY) < Math.abs(wheelX)) wheelY = 0;
-            if (dt != 0) {
-                vX = wheelX / dt;
-                vY = wheelY / dt;
+            if (absTotalY > scrollSwitchDistance && absTotalY > absTotalX * 1.15)
+                wheelX = 0;
+            else if (absTotalX > scrollSwitchDistance && absTotalX > absTotalY * 1.15)
+                wheelY = 0;
+            else {
+                if (10 * Math.abs(wheelX) < Math.abs(wheelY)) wheelX = 0;
+                if (10 * Math.abs(wheelY) < Math.abs(wheelX)) wheelY = 0;
             }
-            editor._emit("mousewheel", mouseEvent);
-            if (!mouseEvent.propagationStopped) {
+            var touchScrollSpeed = 1;
+            wheelX *= touchScrollSpeed;
+            wheelY *= touchScrollSpeed;
+            if (scheduleScrollByTouch(wheelX, wheelY)) {
+                updateVelocity(wheelX, wheelY, dt);
+                e.preventDefault();
+            } else {
                 vX = vY = 0;
             }
         }
@@ -389,20 +588,38 @@ exports.addTouchListeners = function(el, editor) {
     }, editor);
 
     function animate() {
-        animationSteps += 60;
-        animationTimer = setInterval(function() {
-            if (animationSteps-- <= 0) {
-                clearInterval(animationTimer);
-                animationTimer = null;
+        var speed = Math.sqrt(vX * vX + vY * vY);
+        if (speed < minFlingVelocity) {
+            endTouchScroll();
+            return;
+        }
+        beginTouchScroll();
+        animationSteps = 1;
+        animationElapsed = 0;
+        animationLastT = 0;
+        animationTimer = requestFrame(function step(t) {
+            var dt = animationLastT ? t - animationLastT : 16;
+            animationLastT = t;
+            dt = Math.max(0, Math.min(dt || 16, 32));
+            animationElapsed += dt;
+            speed = Math.sqrt(vX * vX + vY * vY);
+            if (speed < minFlingVelocity || animationElapsed > maxFlingDuration) {
+                cancelAnimation();
+                return;
             }
-            if (Math.abs(vX) < 0.01) vX = 0;
-            if (Math.abs(vY) < 0.01) vY = 0;
-            if (animationSteps < 20) vX = 0.9 * vX;
-            if (animationSteps < 20) vY = 0.9 * vY;
+            var velocityScale = Math.exp(-flingFriction * dt);
+            var distanceScale = (1 - velocityScale) / flingFriction;
             var oldScrollTop = editor.session.getScrollTop();
-            editor.renderer.scrollBy(10 * vX, 10 * vY);
-            if (oldScrollTop == editor.session.getScrollTop())
-                animationSteps = 0;
-        }, 10);
+            var oldScrollLeft = editor.session.getScrollLeft();
+            if (!scrollByTouch(vX * distanceScale, vY * distanceScale)
+                || oldScrollTop == editor.session.getScrollTop() && oldScrollLeft == editor.session.getScrollLeft()) {
+                cancelAnimation();
+                return;
+            }
+            vX *= velocityScale;
+            vY *= velocityScale;
+            animationSteps = 1;
+            animationTimer = requestFrame(step);
+        });
     }
 };

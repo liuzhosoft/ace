@@ -988,20 +988,22 @@ class VirtualRenderer {
             this.$textLayer.update(config);
             if (this.$showGutter)
                 this.$gutterLayer.update(config);
-            if (this.$customScrollbar) {
+            if (this.$customScrollbar && !this.$skipTouchScrollExtras) {
                 this.$scrollDecorator.$updateDecorators(config);
             }
             this.$markerBack.update(config);
             this.$markerFront.update(config);
             this.$cursorLayer.update(config);
             this.$selectorLayer.update(config);
-            this.$moveTextAreaToCursor();
+            if (!this.$skipTouchScrollExtras)
+                this.$moveTextAreaToCursor();
             this._signal("afterRender", changes);
             return;
         }
 
         // scrolling
         if (changes & this.CHANGE_SCROLL) {
+            var skipTouchScrollExtras = this.$skipTouchScrollExtras;
             this.$changedLines = null;
             if (changes & this.CHANGE_TEXT || changes & this.CHANGE_LINES)
                 this.$textLayer.update(config);
@@ -1014,14 +1016,16 @@ class VirtualRenderer {
                 else
                     this.$gutterLayer.scrollLines(config);
             }
-            if (this.$customScrollbar) {
+            if (this.$customScrollbar && !skipTouchScrollExtras) {
                 this.$scrollDecorator.$updateDecorators(config);
             }
             this.$markerBack.update(config);
             this.$markerFront.update(config);
             this.$cursorLayer.update(config);
-            this.$selectorLayer.update(config);
-            this.$moveTextAreaToCursor();
+            if (!skipTouchScrollExtras) {
+                this.$selectorLayer.update(config);
+                this.$moveTextAreaToCursor();
+            }
             this._signal("afterRender", changes);
             return;
         }

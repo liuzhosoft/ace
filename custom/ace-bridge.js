@@ -7,6 +7,34 @@ function Bridge(editor) {
     this.editor = editor;
     this.loading = false;
     this.insets = {top: 0, right: 0, bottom: 0, left: 0};
+    this._searchReplacementActive = false;
+    this._searchReplacementChanged = false;
+
+    this._notifyTextChanged = function(fromSearchReplacement) {
+        var len = this.editor.session.getLength();
+        var changed = len !== this.lastTextLength || (len === this.lastTextLength && this.canUndo());
+        var searchReplacementCallback = AndroidEditor.onSearchReplaceTextChanged;
+        if (fromSearchReplacement && typeof searchReplacementCallback === "function") {
+            searchReplacementCallback.call(AndroidEditor, changed);
+        } else {
+            AndroidEditor.onTextChanged(changed);
+        }
+        this.lastTextLength = len;
+    };
+
+    this._runSearchReplacement = function(operation) {
+        this._searchReplacementActive = true;
+        this._searchReplacementChanged = false;
+        try {
+            return operation();
+        } finally {
+            this._searchReplacementActive = false;
+            if (this._searchReplacementChanged) {
+                this._searchReplacementChanged = false;
+                this._notifyTextChanged(true);
+            }
+        }
+    };
 
     this._getInsetNumber = function(data, key) {
         if (!data) return 0;
@@ -276,6 +304,19 @@ function Bridge(editor) {
         });
     };
 
+    this.replaceSearchResult = function (data) {
+        data = data || {};
+        return this._searchAction({
+            action: "replaceCurrent",
+            findText: data.findText,
+            replaceText: data.replaceText,
+            caseSensitive: data.caseSensitive,
+            wholeWordOnly: data.wholeWordOnly,
+            regex: data.regex,
+            focusEditor: data.focusEditor
+        });
+    };
+
     this.clearSearchResult = function () {
         return this._searchAction({action: "clear"});
     };
@@ -290,6 +331,14 @@ function Bridge(editor) {
 
         function emptySummary() {
             return JSON.stringify({current: 0, total: 0});
+        }
+
+        function invalidRegularExpressionSummary() {
+            return JSON.stringify({
+                current: 0,
+                total: 0,
+                errorCode: "invalid_regular_expression"
+            });
         }
 
         function summary() {
@@ -336,18 +385,83 @@ function Bridge(editor) {
             };
         }
 
-        function findStartIndex(ranges) {
+        function createSearch(options) {
+            var Search = require("ace/search").Search;
+            var search = new Search();
+            search.set(options);
+            // 复用 Ace 自身的编译逻辑，兼容其 Unicode 回退和多行正则规则。
+            if (options.regExp && !search.$assembleRegExp(search.getOptions())) {
+                return null;
+            }
+            return search;
+        }
+
+        function hasSameSearchOptions(left, right) {
+            return left && right &&
+                left.needle === right.needle &&
+                left.caseSensitive === right.caseSensitive &&
+                left.regExp === right.regExp &&
+                left.wholeWord === right.wholeWord;
+        }
+
+        function replacementForRange(search, range, replacement) {
+            var options = search.getOptions();
+            // 非正则替换内容不依赖匹配上下文，无需复制并重建整篇文档。
+            if (!options.regExp) return replacement;
+
+            var re = search.$assembleRegExp(options);
+            if (!re) {
+                throw new Error("Search regular expression is unavailable");
+            }
+            // Ace 会把包含真实换行的表达式拆成逐行正则；保持其原有替换行为。
+            if (Array.isArray(re)) return replacement;
+
+            // Search 跨行匹配统一使用 LF，位置索引也必须基于相同的逻辑文本计算。
+            var lines = session.getDocument().getAllLines();
+            var input = lines.join("\n");
+            function positionToIndex(position) {
+                var index = position.column;
+                for (var row = 0; row < position.row; row++) {
+                    index += lines[row].length + 1;
+                }
+                return index;
+            }
+            var start = positionToIndex(range.start);
+            var end = positionToIndex(range.end);
+            var flags = re.flags.replace(/[gy]/g, "") + "y";
+            var targetRe = new RegExp(re.source, flags);
+            targetRe.lastIndex = start;
+            var match = targetRe.exec(input);
+            if (!match || match.index !== start || match[0].length !== end - start) return null;
+
+            var template = search.parseReplaceString(replacement);
+            targetRe.lastIndex = start;
+            var output = input.replace(targetRe, template);
+            var insertedLength = output.length - input.length + end - start;
+            return output.slice(start, start + insertedLength);
+        }
+
+        function findStartIndex(ranges, origin) {
             if (typeof data.startIndex === "number" && isFinite(data.startIndex)) {
                 var index = data.startIndex | 0;
                 if (index < 0) return 0;
                 if (index >= ranges.length) return ranges.length - 1;
                 return index;
             }
-            var cursor = editor.getCursorPosition();
+            var cursor = origin || editor.getCursorPosition();
             for (var i = 0; i < ranges.length; i++) {
-                var start = ranges[i].start;
+                var range = ranges[i];
+                var startsBeforeOrAt = range.start.row < cursor.row ||
+                    (range.start.row === cursor.row && range.start.column <= cursor.column);
+                var endsAfter = range.end.row > cursor.row ||
+                    (range.end.row === cursor.row && range.end.column > cursor.column);
+                // 选项变化可能让同一处匹配向左扩展，优先保留覆盖原锚点的结果。
+                if (startsBeforeOrAt && endsAfter) return i;
+            }
+            for (var j = 0; j < ranges.length; j++) {
+                var start = ranges[j].start;
                 if (start.row > cursor.row || (start.row === cursor.row && start.column >= cursor.column)) {
-                    return i;
+                    return j;
                 }
             }
             return 0;
@@ -361,6 +475,7 @@ function Bridge(editor) {
             }
             state.index = index;
             var range = state.ranges[index];
+            state.searchOrigin = {row: range.start.row, column: range.start.column};
             editor.selection.setSelectionRange(range, false);
             state.activeMarker = session.addMarker(range, "ace_search_active", "text", false);
             editor.renderer.scrollCursorIntoView(null, 0.5);
@@ -375,35 +490,94 @@ function Bridge(editor) {
         }
 
         if (data.action === "replace") {
-            clearSearch();
             var replaceOptions = searchOptions();
-            if (!replaceOptions.needle) return emptySummary();
-            editor.replaceAll(data.replaceText || "", replaceOptions);
+            if (!replaceOptions.needle) {
+                clearSearch();
+                return emptySummary();
+            }
+            if (!createSearch(replaceOptions)) {
+                clearSearch();
+                return invalidRegularExpressionSummary();
+            }
+            clearSearch();
+            bridge._runSearchReplacement(function() {
+                editor.replaceAll(data.replaceText || "", replaceOptions);
+            });
+            return emptySummary();
+        }
+
+        if (data.action === "replaceCurrent") {
+            var currentOptions = searchOptions();
+            if (!currentOptions.needle) return summary();
+            var currentSearch = createSearch(currentOptions);
+            if (!currentSearch) {
+                clearSearch();
+                return invalidRegularExpressionSummary();
+            }
+            state = window.bdSearchState;
+            if (!state || state.session !== session || !state.ranges || !state.ranges.length ||
+                state.index < 0 || state.index >= state.ranges.length) {
+                return summary();
+            }
+            if (!hasSameSearchOptions(state.options, currentOptions)) {
+                throw new Error("Search options do not match the active result");
+            }
+            var currentRange = state.ranges[state.index];
+            var replaceText = data.replaceText == null ? "" : String(data.replaceText);
+            var replacement = replacementForRange(currentSearch, currentRange, replaceText);
+            if (replacement == null) return summary();
+            // 搜索范围会随文档变更失效，替换前复制位置并清理全部 Marker。
+            var targetRange = {
+                start: {row: currentRange.start.row, column: currentRange.start.column},
+                end: {row: currentRange.end.row, column: currentRange.end.column}
+            };
+            clearSearch();
+            var replacementEnd = bridge._runSearchReplacement(function() {
+                return session.replace(targetRange, replacement);
+            });
+            editor.moveCursorToPosition(replacementEnd);
+            editor.renderer.scrollCursorIntoView(null, 0.5);
+            if (data.focusEditor !== false) {
+                editor.focus();
+            }
             return emptySummary();
         }
 
         if (data.action === "find") {
+            var searchOrigin = editor.getCursorPosition();
+            if (state && state.session === session && state.ranges && state.ranges.length &&
+                state.index >= 0 && state.index < state.ranges.length) {
+                var activeStart = state.ranges[state.index].start;
+                // 普通刷新从当前匹配项起点重新定位，避免清除选区后以末尾光标跳到下一项。
+                searchOrigin = {row: activeStart.row, column: activeStart.column};
+            } else if (state && state.session === session && state.searchOrigin) {
+                // 无结果或正则解析失败时继续保留上一次锚点，恢复搜索后仍从原位置定位。
+                searchOrigin = {row: state.searchOrigin.row, column: state.searchOrigin.column};
+            }
             clearSearch();
             var options = searchOptions();
             if (!options.needle) return emptySummary();
-            ensureCss();
-            var Search = require("ace/search").Search;
-            var search = new Search();
-            search.set(options);
-            var ranges = search.findAll(session);
             state = {
                 session: session,
-                ranges: ranges,
+                ranges: [],
                 index: 0,
                 markers: [],
-                activeMarker: null
+                activeMarker: null,
+                options: options,
+                searchOrigin: {row: searchOrigin.row, column: searchOrigin.column}
             };
             window.bdSearchState = state;
+            // 在校验前写入状态，正则表达式解析失败时也不会丢失定位锚点。
+            var search = createSearch(options);
+            if (!search) return invalidRegularExpressionSummary();
+            ensureCss();
+            var ranges = search.findAll(session);
+            state.ranges = ranges;
             for (var i = 0, markerCount = Math.min(ranges.length, markerLimit); i < markerCount; i++) {
                 state.markers.push(session.addMarker(ranges[i], "ace_search_result", "text", false));
             }
             if (ranges.length > 0) {
-                activate(findStartIndex(ranges));
+                activate(findStartIndex(ranges, searchOrigin));
             } else {
                 editor.clearSelection();
             }
@@ -477,11 +651,15 @@ function Bridge(editor) {
     this.bindEditorEventToJava = function () {
         var self = this;
         this.editor.on("change", function (data) {
+            // 文档变化后普通 Range 不再可靠，任何后续操作都必须先重新搜索。
+            self._clearSearchState(false);
             if (self.loading)
                 return;
-            var len = self.editor.session.getLength();
-            AndroidEditor.onTextChanged(len != self.lastTextLength || (len == self.lastTextLength && self.canUndo()));
-            self.lastTextLength = len;
+            if (self._searchReplacementActive) {
+                self._searchReplacementChanged = true;
+                return;
+            }
+            self._notifyTextChanged(false);
 
         });
 

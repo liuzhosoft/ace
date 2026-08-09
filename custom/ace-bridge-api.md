@@ -77,9 +77,22 @@ handleJava(123, { cmd: "setText", data: { text: "...", file: "a.js" } })
 
 ### 查找/替换
 
-- `doFind({ findText: string, replaceText?: string, caseSensitive?: boolean })`
-  - 有 `replaceText` 时执行 `replaceAll`，否则执行 `findAll`
-  - 执行后会将视口滚动到当前选择范围的大致中心位置
+- `doFind({ findText: string, replaceText?: string, caseSensitive?: boolean, wholeWordOnly?: boolean, regex?: boolean, startIndex?: number, focusEditor?: boolean }) -> string`
+  - 有 `replaceText` 时执行全部替换，否则重新计算所有匹配项
+  - 返回 JSON 字符串 `{"current": number, "total": number, "errorCode"?: string}`
+  - 正则表达式无效时返回 `errorCode: "invalid_regular_expression"`，不会按其他字面量继续搜索或替换
+  - 重新计算时保留当前匹配位置；匹配范围变化时优先选择覆盖原位置的结果
+  - `focusEditor === false` 时保留宿主输入框焦点
+- `moveSearchResult({ forward?: boolean, focusEditor?: boolean }) -> string`
+  - `forward === false` 移动到上一个结果，否则移动到下一个结果
+  - 首尾之间循环，并返回当前匹配序号和总数
+- `replaceSearchResult({ findText: string, replaceText?: string, caseSensitive?: boolean, wholeWordOnly?: boolean, regex?: boolean, focusEditor?: boolean }) -> string`
+  - 仅替换当前激活结果，正则模式下支持捕获组替换
+  - 正则模式使用完整文档上下文计算替换内容，支持依赖前后文和零宽匹配的表达式
+  - 替换后光标移动到替换内容末尾，宿主可继续调用 `doFind` 重新计算结果
+- `clearSearchResult() -> string`
+  - 清除搜索 Marker、当前搜索状态和选区
+  - 文档内容变化时 bridge 也会自动清除缓存结果，避免旧 Range 被继续操作
 
 ### 只读/显示/选项
 
@@ -139,7 +152,8 @@ handleJava(123, { cmd: "setText", data: { text: "...", file: "a.js" } })
 
 - `AndroidEditor.returnValue(id: number, value: any)`：用于 `handleJava(id!=0)` 的回传
 - `AndroidEditor.onModeChanged(modeName: string)`：`setMode` 后回调
-- `AndroidEditor.onTextChanged(changed: boolean)`：编辑内容变化回调（基于 session 行数与 undo 状态推断）
+- `AndroidEditor.onTextChanged(changed: boolean)`：普通编辑内容变化回调（基于 session 行数与 undo 状态推断）
+- `AndroidEditor.onSearchReplaceTextChanged?(changed: boolean)`：可选的搜索替换内容变化回调；一次替换命令仅通知一次，未实现时回退到 `onTextChanged`
 - `AndroidEditor.updateCursorBeforeText(text: string)`：光标前最多 30 列的文本片段
 - `AndroidEditor.onScrollStart()` / `AndroidEditor.onScrollEnd()`：滚动开始/结束
 - `AndroidEditor.onCursorStatusChanged(text: string)`：状态栏文本（形如 `"row:col"`，有选择则追加 `"(len)"`）
@@ -151,4 +165,3 @@ handleJava(123, { cmd: "setText", data: { text: "...", file: "a.js" } })
 
 - `line`/`row` 的基准不统一：`gotoLine`/`setText` 使用 Ace 的 `gotoLine(lineNumber, ...)`（通常是从 1 开始），但 `getLineText` 与 `getCurrentPosition` 返回/使用的是 `row`（从 0 开始）。宿主侧建议保持“显示用 1-based，内部 row 用 0-based”的约定，并在调用不同命令时按各自要求转换。
 - `setSearchResult` 会注册一次 `changeCursor` 监听；如果多次调用该命令，可能叠加多个监听器（当前实现未做去重/解绑）。
-
